@@ -17,7 +17,104 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.transforms import GaussianBlur
 
+
+# 수정-2
+class ResBlock(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, 1, 1),
+            nn.InstanceNorm2d(ch),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ch, ch, 3, 1, 1),
+            nn.InstanceNorm2d(ch)
+        )
+    
+    def forward(self, x):
+        return x + self.block(x)
+
+class Generator(nn.Module):
+    def __init__(self, opt):
+        super().__init__()
+
+        input_ch = opt.input_ch
+        output_ch = opt.target_ch
+        n_gf = opt.n_gf
+        norm = get_norm_layer(opt.norm_type)
+        act = nn.LeakyReLU(0.2, inplace=True)
+
+        self.n_gf = n_gf
+
+        # ----- Encoder -----
+        self.d1 = nn.Sequential(nn.Conv2d(input_ch, n_gf, 4, 2, 1), norm(n_gf), act)       # 128
+        self.d2 = nn.Sequential(nn.Conv2d(n_gf, 2 * n_gf, 4, 2, 1), norm(2 * n_gf), act)   # 64
+        self.d3 = nn.Sequential(nn.Conv2d(2 * n_gf, 4 * n_gf, 4, 2, 1), norm(4 * n_gf), act) # 32
+        self.d4 = nn.Sequential(nn.Conv2d(4 * n_gf, 8 * n_gf, 4, 2, 1), norm(8 * n_gf), act) # 16
+        self.d5 = nn.Sequential(nn.Conv2d(8 * n_gf, 16 * n_gf, 4, 2, 1), norm(16 * n_gf), act) # 8
+        self.d6 = nn.Sequential(nn.Conv2d(16 * n_gf, 16 * n_gf, 4, 2, 1), norm(16 * n_gf), act) # 4
+        self.d7 = nn.Sequential(nn.Conv2d(16 * n_gf, 16 * n_gf, 4, 2, 1), norm(16 * n_gf), act) # 2
+
+        # ----- Latent vector -----
+        latent_dim = 16 * n_gf
+        self.fc_mu = nn.Linear(latent_dim * 2 * 2, latent_dim)
+        self.fc_logvar = nn.Linear(latent_dim * 2 * 2, latent_dim)
+        self.fc_decode = nn.Linear(latent_dim, latent_dim * 2 * 2)
+
+        # ----- Decoder -----
+        def upconv(in_ch, out_ch):
+            return nn.Sequential(nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1), norm(out_ch), act)
+
+        self.u1 = upconv(16 * n_gf, 16 * n_gf)               # 4
+        self.u2 = upconv(2 * 16 * n_gf, 16 * n_gf)           # 8
+        self.res2 = ResBlock(16 * n_gf)
+
+        self.u3 = upconv(2 * 16 * n_gf, 8 * n_gf)            # 16
+        self.u4 = upconv(2 * 8 * n_gf, 4 * n_gf)             # 32
+        self.res4 = ResBlock(4 * n_gf)
+
+        self.u5 = upconv(2 * 4 * n_gf, 2 * n_gf)             # 64
+        self.u6 = upconv(2 * 2 * n_gf, n_gf)                 # 128
+        self.u7 = upconv(2 * n_gf, n_gf)                     # 256
+        self.u8 = nn.Conv2d(n_gf, output_ch, 5, 1, 2)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def forward(self, x):
+        # ----- Encoder -----
+        e1 = self.d1(x)
+        e2 = self.d2(e1)
+        e3 = self.d3(e2)
+        e4 = self.d4(e3)
+        e5 = self.d5(e4)
+        e6 = self.d6(e5)
+        e7 = self.d7(e6)
+
+        # ----- Latent -----
+        z_flat = e7.view(e7.size(0), -1)
+        mu, logvar = self.fc_mu(z_flat), self.fc_logvar(z_flat)
+        z = self.reparameterize(mu, logvar)
+        decode = self.fc_decode(z).view(e7.size(0), 16 * self.n_gf, 2, 2)
+
+        # ----- Decoder -----
+        d = self.u1(decode)
+        d = self.u2(torch.cat([d, e6], dim=1))
+        d = self.res2(d)
+        d = self.u3(torch.cat([d, e5], dim=1))
+        d = self.u4(torch.cat([d, e4], dim=1))
+        d = self.res4(d)
+        d = self.u5(torch.cat([d, e3], dim=1))
+        d = self.u6(torch.cat([d, e2], dim=1))
+        d = self.u7(torch.cat([d, e1], dim=1))
+        d = self.u8(d)
+
+        return torch.tanh(d), mu, logvar  # 또는 clamp(d, -1, 1)
+
+# 수정-1
+'''
 class Generator(nn.Module):
     def __init__(self, opt):
         super(Generator, self).__init__()
@@ -88,6 +185,8 @@ class Generator(nn.Module):
         out = self.u_layer8(out)
 
         return out, mu, logvar
+
+'''
 
 
 '''
@@ -194,7 +293,109 @@ class Mish(nn.Module):
 
 #==============================================================================
 # [2] Discriminative Network
+class PatchDiscriminator(nn.Module):
+    def __init__(self, opt):
+        super(PatchDiscriminator, self).__init__()
 
+        if opt.ch_balance > 0:
+            ch_ratio = float(opt.input_ch) / float(opt.target_ch) * opt.ch_balance
+            if ch_ratio > 1:
+                input_channel = opt.input_ch + opt.target_ch * int(ch_ratio)
+            elif ch_ratio < 1:
+                input_channel = opt.input_ch * int(1 / ch_ratio) + opt.target_ch
+            else:
+                input_channel = opt.input_ch + opt.target_ch
+        else:
+            input_channel = opt.input_ch + opt.target_ch
+
+        ndf = opt.n_df
+        act = nn.LeakyReLU(0.2, inplace=True)
+        norm_type = getattr(opt, 'norm_type', 'instance')
+        use_spectral = getattr(opt, 'use_spectral', True)
+
+        def conv(in_c, out_c, stride=2, dilation=1, norm=True):
+            padding = dilation  # 유지된 출력 크기를 위해 dilation만큼 패딩
+            layers = [nn.Conv2d(in_c, out_c, kernel_size=4, stride=stride, padding=padding, dilation=dilation)]
+            if use_spectral:
+                layers[0] = nn.utils.spectral_norm(layers[0])
+            if norm:
+                layers.append(get_norm_layer(norm_type)(out_c))
+            layers.append(act)
+            return nn.Sequential(*layers)
+
+        # ✅ Receptive field 강화된 구조
+        self.block1 = conv(input_channel, ndf, stride=2)
+        self.block2 = conv(ndf, ndf * 2, stride=2)
+        self.block3 = conv(ndf * 2, ndf * 4, stride=2)
+        self.block4 = conv(ndf * 4, ndf * 8, stride=1, dilation=2)  # dilated conv
+        self.block5 = conv(ndf * 8, ndf * 8, stride=1, dilation=4)  # dilated conv
+        self.final = nn.Conv2d(ndf * 8, 1, kernel_size=3, stride=1, padding=1)
+        if use_spectral:
+            self.final = nn.utils.spectral_norm(self.final)
+
+    def forward(self, x):
+        feat = []
+        x = self.block1(x); feat.append(x)
+        x = self.block2(x); feat.append(x)
+        x = self.block3(x); feat.append(x)
+        x = self.block4(x); feat.append(x)
+        x = self.block5(x); feat.append(x)
+        out = self.final(x)
+        feat.append(out)
+        return feat
+
+
+
+# 원본
+"""
+class PatchDiscriminator(nn.Module):
+    def __init__(self, opt):
+        super(PatchDiscriminator, self).__init__()
+        
+        #----------------------------------------------------------------------
+        if opt.ch_balance > 0:
+            ch_ratio = np.float(opt.input_ch)/np.float(opt.target_ch)
+            ch_ratio *= opt.ch_balance
+            if ch_ratio > 1:
+                input_channel = opt.input_ch + opt.target_ch*np.int(ch_ratio)                            
+            elif ch_ratio < 1:
+                input_channel = opt.input_ch*np.int(1/ch_ratio) + opt.target_ch
+            else:
+                input_channel = opt.input_ch + opt.target_ch
+        else:
+            input_channel = opt.input_ch + opt.target_ch
+        
+        #----------------------------------------------------------------------
+        act = nn.LeakyReLU(0.2, inplace=True)
+        n_df = opt.n_df #64
+        norm = nn.InstanceNorm2d
+        
+        #----------------------------------------------------------------------
+        blocks = []
+        blocks += [[nn.Conv2d(input_channel, n_df, kernel_size=4, padding=1, stride=2), act]]
+        blocks += [[nn.Conv2d(n_df, 2 * n_df, kernel_size=4, padding=1, stride=2), norm(2 * n_df), act]]
+        blocks += [[nn.Conv2d(2 * n_df, 4 * n_df, kernel_size=4, padding=1, stride=2), norm(4 * n_df), act]]
+        blocks += [[nn.Conv2d(4 * n_df, 8 * n_df, kernel_size=4, padding=1, stride=2), norm(8 * n_df), act]]
+        blocks += [[nn.Conv2d(8 * n_df, 1, kernel_size=4, padding=1, stride=1)]]
+
+        self.n_blocks = len(blocks)
+        for i in range(self.n_blocks):
+            setattr(self, 'block_{}'.format(i), nn.Sequential(*blocks[i]))
+            
+        #----------------------------------------------------------------------
+        
+        
+    def forward(self, x):
+        result = [x]
+        for i in range(self.n_blocks):
+            block = getattr(self, 'block_{}'.format(i))
+            result.append(block(result[-1]))
+
+        return result[1:]  # except for the input
+"""
+
+"""
+# 수정본
 class PatchDiscriminator(nn.Module):
     def __init__(self, opt):
         super(PatchDiscriminator, self).__init__()
@@ -239,9 +440,50 @@ class PatchDiscriminator(nn.Module):
             result.append(block(result[-1]))
 
         return result[1:]  # except for the input
-
+"""
 #------------------------------------------------------------------------------
+# 수정본
+class Discriminator(nn.Module):
+    def __init__(self, opt, use_gaussian_blur=False):
+        super(Discriminator, self).__init__()
 
+        self.n_D = opt.n_D
+        self.use_blur_input = getattr(opt, 'use_blur_input', False)
+        self.use_gaussian_blur = getattr(opt, 'use_gaussian_blur', False)
+
+        # Discriminator for each scale
+        self.scales = nn.ModuleList([PatchDiscriminator(opt) for _ in range(self.n_D)])
+
+        # Downsampling module between scales
+        self.downsample = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+        self.use_gaussian_blur = use_gaussian_blur
+
+        # Optional Gaussian blur for anti-artifact support
+        if self.use_gaussian_blur:
+            self.blur = GaussianBlur(kernel_size=5, sigma=(1.0, 1.0))
+
+        print("Total D parameters:", sum(p.numel() for p in self.parameters() if p.requires_grad))
+
+    def forward(self, x):
+        outputs = []
+        for i, D in enumerate(self.scales):
+            x_input = x
+
+            # Optional: Concatenate blurred version to enhance salt-and-pepper detection
+            if self.use_blur_input and i == 0:
+                blurred = self.blur(x) if self.use_gaussian_blur else nn.functional.avg_pool2d(x, 3, stride=1, padding=1)
+                x_input = torch.cat([x, blurred], dim=1)
+
+            outputs.append(D(x_input))
+
+            if i != self.n_D - 1:
+                x = self.downsample(x)
+
+        return outputs  # List of feature lists from each scale
+
+# 원본
+"""
 class Discriminator(nn.Module):
     def __init__(self, opt):
         super(Discriminator, self).__init__()
@@ -263,7 +505,7 @@ class Discriminator(nn.Module):
                 x = nn.AvgPool2d(kernel_size=3, padding=1, stride=2, count_include_pad=False)(x)
                 
         return result
-
+"""
 
 
 #==============================================================================

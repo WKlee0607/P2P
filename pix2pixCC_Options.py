@@ -43,13 +43,13 @@ class BaseOption(object):
         #----------------------------------------------------------------------
         # network setting
         # 모델 파라미터 변경시 수정 
-        self.parser.add_argument('--batch_size', type=int, default=32, help='the number of batch_size') # 64
+        self.parser.add_argument('--batch_size', type=int, default=64, help='the number of batch_size') # 64
 
         self.parser.add_argument('--n_downsample', type=int, default=4, help='how many times you want to downsample input data in Generator')
         self.parser.add_argument('--n_residual', type=int, default=9, help='the number of residual blocks in Generator')
         self.parser.add_argument('--trans_conv', type=bool, default=True, help='using transposed convolutions in Generator')
 
-        self.parser.add_argument('--n_D', type=int, default=1, help='how many Discriminators in differet scales you want to use')
+        self.parser.add_argument('--n_D', type=int, default=3, help='how many Discriminators in differet scales you want to use') # 1
         self.parser.add_argument('--n_CC', type=int, default=4, help='how many downsample output data to compute CC values')
 
         self.parser.add_argument('--n_gf', type=int, default=64, help='The number of channels in the first convolutional layer of the Generator')

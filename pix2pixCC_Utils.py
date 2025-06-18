@@ -32,6 +32,8 @@ def get_grid(input, is_real=True):
 #==============================================================================
 # [2] Set the Normalization method for the input layer
 
+
+
 def get_norm_layer(type):
     if type == 'BatchNorm2d':
         layer = partial(nn.BatchNorm2d,affine=True)
